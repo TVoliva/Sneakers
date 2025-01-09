@@ -1,0 +1,217 @@
+# AD Security Assessment Script
+# Combines enumeration, privilege escalation checks, and lateral movement capabilities
+
+function Write-ColorOutput {
+    param(
+        [string]$Message,
+        [string]$Color = "White"
+    )
+    Write-Host "[*] $Message" -ForegroundColor $Color
+}
+
+#Region Enumeration Functions
+function Start-ADEnumeration {
+    param(
+        [string]$Domain = $env:USERDOMAIN
+    )
+    
+    Write-ColorOutput "Starting Active Directory Enumeration" "Green"
+    
+    # Create results directory
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $resultsDir = ".\AD_Assessment_$timestamp"
+    New-Item -ItemType Directory -Path $resultsDir -Force | Out-Null
+    
+    try {
+        # Domain Information
+        Write-ColorOutput "Gathering Domain Information..." "Yellow"
+        $domainInfo = Get-ADDomain -Identity $Domain
+        $domainInfo | Export-Csv "$resultsDir\domain_info.csv" -NoTypeInformation
+        
+        # Users Enumeration
+        Write-ColorOutput "Enumerating Domain Users..." "Yellow"
+        Get-ADUser -Filter * -Properties * | Select-Object Name, Enabled, LastLogonDate, 
+            PasswordLastSet, AdminCount, ServicePrincipalNames |
+            Export-Csv "$resultsDir\domain_users.csv" -NoTypeInformation
+        
+        # Privileged Groups Enumeration
+        Write-ColorOutput "Enumerating Privileged Groups..." "Yellow"
+        $privilegedGroups = @(
+            "Domain Admins",
+            "Enterprise Admins",
+            "Schema Admins",
+            "Account Operators",
+            "Backup Operators"
+        )
+        
+        foreach ($group in $privilegedGroups) {
+            try {
+                Get-ADGroupMember -Identity $group -Recursive | 
+                    Select-Object Name, ObjectClass, distinguishedName |
+                    Export-Csv "$resultsDir\${group}_members.csv" -NoTypeInformation
+            }
+            catch {
+                Write-ColorOutput "Error enumerating group $group : $_" "Red"
+            }
+        }
+        
+        # Computer Enumeration
+        Write-ColorOutput "Enumerating Domain Computers..." "Yellow"
+        Get-ADComputer -Filter * -Properties * | 
+            Select-Object Name, OperatingSystem, Enabled, LastLogonDate |
+            Export-Csv "$resultsDir\domain_computers.csv" -NoTypeInformation
+    }
+    catch {
+        Write-ColorOutput "Error during enumeration: $_" "Red"
+    }
+    
+    return $resultsDir
+}
+
+#Region Privilege Escalation Functions
+function Find-PrivescVulnerabilities {
+    param(
+        [string]$ComputerName = $env:COMPUTERNAME,
+        [string]$OutputDir
+    )
+    
+    Write-ColorOutput "Starting Privilege Escalation Checks" "Green"
+    
+    try {
+        # Check for unquoted service paths
+        Write-ColorOutput "Checking for unquoted service paths..." "Yellow"
+        $services = Get-WmiObject -Class Win32_Service -ComputerName $ComputerName
+        $services | Where-Object {
+            $_.PathName -match '.* .*' -and 
+            $_.PathName -notmatch '\".*\"' -and 
+            $_.StartMode -eq 'Auto'
+        } | Select-Object Name, PathName, StartMode |
+            Export-Csv "$OutputDir\unquoted_services.csv" -NoTypeInformation
+        
+        # Check for modifiable service binaries
+        Write-ColorOutput "Checking for modifiable service binaries..." "Yellow"
+        foreach ($service in $services) {
+            $path = ($service.PathName -split '.exe')[0] + '.exe'
+            $path = $path.Trim('"')
+            try {
+                $acl = Get-Acl $path -ErrorAction SilentlyContinue
+                if ($acl.Access | Where-Object {$_.IdentityReference -match 'Everyone|BUILTIN\\Users' -and $_.FileSystemRights -match 'Modify|FullControl'}) {
+                    [PSCustomObject]@{
+                        ServiceName = $service.Name
+                        Path = $path
+                        Permissions = "Modifiable by non-privileged users"
+                    }
+                }
+            }
+            catch {}
+        } | Export-Csv "$OutputDir\modifiable_services.csv" -NoTypeInformation
+        
+        # Check for AlwaysInstallElevated
+        Write-ColorOutput "Checking AlwaysInstallElevated registry keys..." "Yellow"
+        $hklm = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name "AlwaysInstallElevated" -ErrorAction SilentlyContinue
+        $hkcu = Get-ItemProperty -Path "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name "AlwaysInstallElevated" -ErrorAction SilentlyContinue
+        
+        [PSCustomObject]@{
+            HKLM_Enabled = if ($hklm) {$hklm.AlwaysInstallElevated -eq 1} else {$false}
+            HKCU_Enabled = if ($hkcu) {$hkcu.AlwaysInstallElevated -eq 1} else {$false}
+        } | Export-Csv "$OutputDir\always_install_elevated.csv" -NoTypeInformation
+    }
+    catch {
+        Write-ColorOutput "Error during privilege escalation checks: $_" "Red"
+    }
+}
+
+#Region Lateral Movement Functions
+function Test-LateralMovement {
+    param(
+        [string[]]$TargetComputers,
+        [string]$OutputDir
+    )
+    
+    Write-ColorOutput "Testing Lateral Movement Possibilities" "Green"
+    
+    $results = @()
+    
+    foreach ($computer in $TargetComputers) {
+        Write-ColorOutput "Testing connectivity to $computer..." "Yellow"
+        
+        $result = [PSCustomObject]@{
+            ComputerName = $computer
+            PingStatus = "Fail"
+            WinRM = "Fail"
+            SMB = "Fail"
+            RPC = "Fail"
+        }
+        
+        # Test Ping
+        if (Test-Connection -ComputerName $computer -Count 1 -Quiet) {
+            $result.PingStatus = "Success"
+            
+            # Test WinRM
+            try {
+                $session = New-PSSession -ComputerName $computer -ErrorAction Stop
+                if ($session) {
+                    $result.WinRM = "Success"
+                    Remove-PSSession $session
+                }
+            }
+            catch {}
+            
+            # Test SMB
+            try {
+                $null = Test-Path "\\$computer\C$" -ErrorAction Stop
+                $result.SMB = "Success"
+            }
+            catch {}
+            
+            # Test RPC
+            try {
+                $null = Get-WmiObject -Class Win32_OperatingSystem -ComputerName $computer -ErrorAction Stop
+                $result.RPC = "Success"
+            }
+            catch {}
+        }
+        
+        $results += $result
+    }
+    
+    $results | Export-Csv "$OutputDir\lateral_movement_tests.csv" -NoTypeInformation
+}
+
+function Start-Assessment {
+    param(
+        [string]$Domain = $env:USERDOMAIN,
+        [string[]]$TargetComputers
+    )
+    
+    Write-ColorOutput "Starting Complete AD Security Assessment" "Green"
+    
+    # Start Enumeration
+    $resultsDir = Start-ADEnumeration -Domain $Domain
+    
+    # Privilege Escalation Checks
+    Find-PrivescVulnerabilities -OutputDir $resultsDir
+    
+    # Lateral Movement Tests
+    if (-not $TargetComputers) {
+        $TargetComputers = Import-Csv "$resultsDir\domain_computers.csv" | 
+            Where-Object {$_.Enabled -eq $true} | 
+            Select-Object -ExpandProperty Name
+    }
+    Test-LateralMovement -TargetComputers $TargetComputers -OutputDir $resultsDir
+    
+    Write-ColorOutput "Assessment Complete! Results saved in: $resultsDir" "Green"
+}
+
+# Example usage:
+# Start-Assessment -Domain "contoso.local" -TargetComputers @("SERVER1", "SERVER2")
+
+# Created/Modified files during execution:
+# - AD_Assessment_[timestamp]/domain_info.csv
+# - AD_Assessment_[timestamp]/domain_users.csv
+# - AD_Assessment_[timestamp]/[group]_members.csv
+# - AD_Assessment_[timestamp]/domain_computers.csv
+# - AD_Assessment_[timestamp]/unquoted_services.csv
+# - AD_Assessment_[timestamp]/modifiable_services.csv
+# - AD_Assessment_[timestamp]/always_install_elevated.csv
+# - AD_Assessment_[timestamp]/lateral_movement_tests.csv
